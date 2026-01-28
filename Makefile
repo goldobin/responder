@@ -1,7 +1,7 @@
 .PHONY: fmt lint test
 
 test:
-	@go test -race ./...
+	@go test -v -race ./...
 
 lint:
 	@golangci-lint run
