@@ -210,3 +210,20 @@ func Error[T any, R any](err error) Responder[T, R] {
 		return zero, err
 	})
 }
+
+func FanOut[T any, R any](rs []Responder[T, R]) Responder[T, []R] {
+	return Func[T, []R](func(ctx context.Context, req T) ([]R, error) {
+		responses := make([]R, len(rs))
+		var errs []error
+		for i, r := range rs {
+			resp, err := r.Respond(ctx, req)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			responses[i] = resp
+		}
+
+		return responses, errors.Join(errs...)
+	})
+}

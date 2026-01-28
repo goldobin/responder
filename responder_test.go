@@ -165,3 +165,34 @@ func Test_Safe_Respond_Panic(t *testing.T) {
 	assert.Contains(t, err.Error(), "panicked")
 	assert.Equal(t, response{}, resp)
 }
+
+func Test_FanOut(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	var count atomic.Uint32
+	rs := []responder.Responder[request, int]{
+		responder.Func[request, int](func(context.Context, request) (int, error) {
+			count.Add(1)
+			return 1, nil
+		}),
+		responder.Func[request, int](func(context.Context, request) (int, error) {
+			count.Add(1)
+			return 2, nil
+		}),
+		responder.Func[request, int](func(context.Context, request) (int, error) {
+			count.Add(1)
+			return 3, nil
+		}),
+	}
+	fanOut := responder.FanOut(rs)
+
+	// When
+	responses, err := fanOut.Respond(context.Background(), request{})
+
+	// Then
+	assert.NoError(t, err)
+	assert.Len(t, responses, 3)
+	assert.Equal(t, []int{1, 2, 3}, responses)
+	assert.Equal(t, uint32(3), count.Load())
+}
