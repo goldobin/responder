@@ -1,18 +1,21 @@
-package main
+package responder_test
 
 import (
 	"context"
 	"sync/atomic"
 	"testing"
 
+	"github.com/goldobin/responder"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/semaphore"
 )
 
-type mock struct {
-	count atomic.Uint32
-}
+type (
+	mock     struct{ count atomic.Uint32 }
+	request  struct{}
+	response struct{}
+)
 
 func (m *mock) Respond(context.Context, request) (response, error) {
 	m.count.Add(1)
@@ -22,7 +25,7 @@ func (m *mock) Respond(context.Context, request) (response, error) {
 func Test_Proxy_Respond(t *testing.T) {
 	tests := []struct {
 		name        string
-		opts        []Option
+		opts        []responder.Option
 		numRequests int
 	}{
 		{
@@ -32,43 +35,63 @@ func Test_Proxy_Respond(t *testing.T) {
 		},
 		{
 			name:        "buffer size 1, sequential",
-			opts:        []Option{WithBuffSize(1)},
+			opts:        []responder.Option{responder.WithBuffer(1)},
 			numRequests: 1,
 		},
 		{
 			name:        "buffer size 10, sequential",
-			opts:        []Option{WithBuffSize(10)},
+			opts:        []responder.Option{responder.WithBuffer(10)},
 			numRequests: 5,
 		},
 		{
 			name:        "zero buffer, concurrent",
-			opts:        []Option{WithConcurrency()},
+			opts:        []responder.Option{responder.WithUnboundConcurrency()},
 			numRequests: 1,
 		},
 		{
 			name:        "buffer size 1, concurrent",
-			opts:        []Option{WithBuffSize(1), WithConcurrency()},
+			opts:        []responder.Option{responder.WithBuffer(1), responder.WithUnboundConcurrency()},
 			numRequests: 1,
 		},
 		{
 			name:        "buffer size 10, concurrent",
-			opts:        []Option{WithBuffSize(10), WithConcurrency()},
+			opts:        []responder.Option{responder.WithBuffer(10), responder.WithUnboundConcurrency()},
 			numRequests: 5,
 		},
 		{
 			name:        "zero buffer, with semaphore",
-			opts:        []Option{WithSemaphore(semaphore.NewWeighted(5), 1)},
+			opts:        []responder.Option{responder.WithSemaphore(semaphore.NewWeighted(5), 1)},
 			numRequests: 1,
 		},
 		{
 			name:        "buffer size 10, with semaphore weight 1",
-			opts:        []Option{WithBuffSize(10), WithSemaphore(semaphore.NewWeighted(5), 1)},
+			opts:        []responder.Option{responder.WithBuffer(10), responder.WithSemaphore(semaphore.NewWeighted(5), 1)},
 			numRequests: 5,
 		},
 		{
 			name:        "buffer size 10, with semaphore weight 2",
-			opts:        []Option{WithBuffSize(10), WithSemaphore(semaphore.NewWeighted(10), 2)},
+			opts:        []responder.Option{responder.WithBuffer(10), responder.WithSemaphore(semaphore.NewWeighted(10), 2)},
 			numRequests: 5,
+		},
+		{
+			name:        "zero buffer, bound concurrency 1",
+			opts:        []responder.Option{responder.WithBoundConcurrency(1)},
+			numRequests: 1,
+		},
+		{
+			name:        "zero buffer, bound concurrency 5",
+			opts:        []responder.Option{responder.WithBoundConcurrency(5)},
+			numRequests: 5,
+		},
+		{
+			name:        "buffer size 10, bound concurrency 1",
+			opts:        []responder.Option{responder.WithBuffer(10), responder.WithBoundConcurrency(1)},
+			numRequests: 5,
+		},
+		{
+			name:        "buffer size 10, bound concurrency 5",
+			opts:        []responder.Option{responder.WithBuffer(10), responder.WithBoundConcurrency(5)},
+			numRequests: 10,
 		},
 	}
 
@@ -81,7 +104,7 @@ func Test_Proxy_Respond(t *testing.T) {
 			ctx := context.Background()
 
 			// When
-			p, newErr := newProxy(&m, tt.opts...)
+			p, newErr := responder.NewProxy(&m, tt.opts...)
 			require.NoError(t, newErr)
 
 			for i := 0; i < tt.numRequests; i++ {
@@ -100,10 +123,8 @@ func Test_Proxy_Respond(t *testing.T) {
 
 func Test_Safe_Respond_Success(t *testing.T) {
 	// Given
-	underlying := responderFunc(func(ctx context.Context, req request) (response, error) {
-		return response{}, nil
-	})
-	s := &safe{underlying: underlying}
+	underlying := responder.Same[request, response](response{})
+	s := responder.Safe(underlying)
 
 	// When
 	resp, err := s.Respond(context.Background(), request{})
@@ -117,27 +138,24 @@ func Test_Safe_Respond_Error(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	expectedErr := assert.AnError
-	underlying := responderFunc(func(ctx context.Context, req request) (response, error) {
-		return response{}, expectedErr
-	})
-	s := &safe{underlying: underlying}
+	underlying := responder.Error[request, response](assert.AnError)
+	s := responder.Safe(underlying)
 
 	// When
 	_, err := s.Respond(context.Background(), request{})
 
 	// Then
-	assert.ErrorIs(t, err, expectedErr)
+	assert.ErrorIs(t, err, assert.AnError)
 }
 
 func Test_Safe_Respond_Panic(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	underlying := responderFunc(func(ctx context.Context, req request) (response, error) {
+	underlying := responder.Func[request, response](func(context.Context, request) (response, error) {
 		panic("something went wrong")
 	})
-	s := &safe{underlying: underlying}
+	s := responder.Safe(underlying)
 
 	// When
 	resp, err := s.Respond(context.Background(), request{})
