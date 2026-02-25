@@ -3,6 +3,7 @@ package responder_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,27 +15,18 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-type (
-	mock     struct{ count atomic.Uint32 }
-	request  struct{}
-	response struct{}
-)
-
-func (m *mock) Respond(context.Context, request) (response, error) {
-	m.count.Add(1)
-	return response{}, nil
-}
-
 func Test_Safe(t *testing.T) {
 	// Given
-	underlying := responder.Same[request, response](response{})
-	s := responder.Safe(underlying)
+	var (
+		target = responder.Same[request](response{})
+		s      = responder.Safe(target)
+	)
 
 	// When
 	resp, err := s.Respond(context.Background(), request{})
 
 	// Then
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, response{}, resp)
 }
 
@@ -42,8 +34,10 @@ func Test_SafeError(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	underlying := responder.Error[request, response](assert.AnError)
-	s := responder.Safe(underlying)
+	var (
+		target = responder.Error[request, response](assert.AnError)
+		s      = responder.Safe(target)
+	)
 
 	// When
 	_, err := s.Respond(context.Background(), request{})
@@ -56,17 +50,18 @@ func Test_SafePanic(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	underlying := responder.Func[request, response](func(context.Context, request) (response, error) {
-		panic("something went wrong")
-	})
-	s := responder.Safe(underlying)
+	var (
+		targetFn = func(context.Context, request) (response, error) {
+			panic("something went wrong")
+		}
+		s = responder.Safe(responder.Func(targetFn))
+	)
 
 	// When
 	resp, err := s.Respond(context.Background(), request{})
 
 	// Then
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "panicked")
+	assert.ErrorIs(t, err, responder.Panicked)
 	assert.Equal(t, response{}, resp)
 }
 
@@ -76,15 +71,15 @@ func Test_FanOut(t *testing.T) {
 	// Given
 	var count atomic.Uint32
 	rs := []responder.Responder[request, int]{
-		responder.Func[request, int](func(context.Context, request) (int, error) {
+		responder.Func(func(context.Context, request) (int, error) {
 			count.Add(1)
 			return 1, nil
 		}),
-		responder.Func[request, int](func(context.Context, request) (int, error) {
+		responder.Func(func(context.Context, request) (int, error) {
 			count.Add(1)
 			return 2, nil
 		}),
-		responder.Func[request, int](func(context.Context, request) (int, error) {
+		responder.Func(func(context.Context, request) (int, error) {
 			count.Add(1)
 			return 3, nil
 		}),
@@ -95,7 +90,7 @@ func Test_FanOut(t *testing.T) {
 	responses, err := fanOut.Respond(context.Background(), request{})
 
 	// Then
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Len(t, responses, 3)
 	assert.Equal(t, []int{1, 2, 3}, responses)
 	assert.Equal(t, uint32(3), count.Load())
@@ -105,29 +100,31 @@ func Test_FanOutError(t *testing.T) {
 	t.Parallel()
 
 	// Given - mix of successful and failing responders
-	err1 := errors.New("error 1")
-	err2 := errors.New("error 2")
-	rs := []responder.Responder[request, int]{
-		responder.Func[request, int](func(context.Context, request) (int, error) {
-			return 1, nil
-		}),
-		responder.Func[request, int](func(context.Context, request) (int, error) {
-			return 0, err1
-		}),
-		responder.Func[request, int](func(context.Context, request) (int, error) {
-			return 3, nil
-		}),
-		responder.Func[request, int](func(context.Context, request) (int, error) {
-			return 0, err2
-		}),
-	}
-	fanOut := responder.FanOut(rs)
+	var (
+		err1 = errors.New("error 1")
+		err2 = errors.New("error 2")
+		rs   = []responder.Responder[request, int]{
+			responder.Func(func(context.Context, request) (int, error) {
+				return 1, nil
+			}),
+			responder.Func(func(context.Context, request) (int, error) {
+				return 0, err1
+			}),
+			responder.Func(func(context.Context, request) (int, error) {
+				return 3, nil
+			}),
+			responder.Func(func(context.Context, request) (int, error) {
+				return 0, err2
+			}),
+		}
+		fanOut = responder.FanOut(rs)
+	)
 
 	// When
 	responses, err := fanOut.Respond(context.Background(), request{})
 
 	// Then - all responders called, errors joined
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.ErrorIs(t, err, err1)
 	assert.ErrorIs(t, err, err2)
 	assert.Len(t, responses, 4)
@@ -216,15 +213,14 @@ func Test_Proxy(t *testing.T) {
 			ctx := context.Background()
 
 			// When
-			p, newErr := responder.NewProxy(&m, tt.opts...)
-			require.NoError(t, newErr)
+			p := responder.NewProxy[request, response](&m, tt.opts...)
 
 			for i := 0; i < tt.numRequests; i++ {
 				_, respErr := p.Respond(ctx, request{})
 				assert.NoError(t, respErr)
 			}
 
-			closeErr := p.Close(ctx)
+			closeErr := p.Close()
 
 			// Then
 			assert.NoError(t, closeErr)
@@ -266,8 +262,9 @@ func Test_Proxy_InvalidOptions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := responder.NewProxy(responder.Same[request, response](response{}), tt.opts...)
-			assert.Error(t, err)
+			assert.Panics(t, func() {
+				responder.NewProxy(responder.Same[request, response](response{}), tt.opts...)
+			})
 		})
 	}
 }
@@ -276,47 +273,85 @@ func Test_Proxy_RespondAfterClose(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	p, err := responder.NewProxy(responder.Same[request, response](response{}))
-	require.NoError(t, err)
+	var (
+		target = responder.Same[request, response](response{})
+		p      = responder.NewProxy(target)
+	)
+
+	// When - close, then try to respond with a short timeout
+	_ = p.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := p.Respond(ctx, request{})
+
+	// Then - send on nil channel blocks, so context timeout wins
+	require.Error(t, err)
+	assert.ErrorIs(t, err, responder.Closed)
+}
+
+func Test_Proxy_ConcurrentRespondAndClose(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	var (
+		runs        = 10
+		iterations  = 10
+		parallelism = 10
+		targetFn    = func(context.Context, request) (response, error) { return response{}, nil }
+		target      = responder.Func(targetFn)
+	)
 
 	// When
-	_ = p.Close(context.Background())
-	_, err = p.Respond(context.Background(), request{})
+	for ri := 0; ri < runs; ri++ {
+		t.Run(fmt.Sprintf("run %d", ri), func(t *testing.T) {
+			var wg sync.WaitGroup
+			defer wg.Wait()
 
-	// Then
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "closed")
+			p := responder.NewProxy(target, responder.WithBuffer(5))
+			for i := 0; i < parallelism; i++ {
+				wg.Go(func() {
+					for j := 0; j < iterations; j++ {
+						_, _ = p.Respond(context.Background(), request{})
+					}
+				})
+
+				wg.Go(func() {
+					_ = p.Close()
+				})
+			}
+
+		})
+	}
 }
 
 func Test_Proxy_DoubleClose(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	p, err := responder.NewProxy(responder.Same[request, response](response{}))
-	require.NoError(t, err)
+	p := responder.NewProxy(responder.Same[request, response](response{}))
 
 	// When
-	err1 := p.Close(context.Background())
-	err2 := p.Close(context.Background())
+	err1 := p.Close()
+	err2 := p.Close()
 
 	// Then
 	assert.NoError(t, err1)
-	assert.Error(t, err2)
-	assert.Contains(t, err2.Error(), "already closed")
+	assert.ErrorIs(t, err2, responder.Closed)
 }
 
 func Test_Proxy_ContextCancelledBeforeSend(t *testing.T) {
 	t.Parallel()
 
 	// Given - unbuffered channel, no reader yet
-	blocker := make(chan struct{})
-	done := make(chan struct{})
-	underlying := responder.Func[request, response](func(ctx context.Context, req request) (response, error) {
-		<-blocker // block forever
-		return response{}, nil
-	})
-	p, err := responder.NewProxy(underlying) // unbuffered
-	require.NoError(t, err)
+	var (
+		blocker  = make(chan struct{})
+		done     = make(chan struct{})
+		targetFn = func(ctx context.Context, req request) (response, error) {
+			<-blocker // block forever
+			return response{}, nil
+		}
+		p = responder.NewProxy(responder.Func(targetFn)) // unbuffered
+	)
 
 	// Start one request to block the worker
 	go func() {
@@ -328,58 +363,58 @@ func Test_Proxy_ContextCancelledBeforeSend(t *testing.T) {
 	// When - try to send with already canceled context
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = p.Respond(ctx, request{})
+	_, err := p.Respond(ctx, request{})
 
 	// Then
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "context done")
+	assert.ErrorIs(t, err, context.Canceled)
 
 	// Cleanup - unblock and wait
 	close(blocker)
 	<-done
-	_ = p.Close(context.Background())
+	_ = p.Close()
 }
 
 func Test_Proxy_ContextCancelledWhileWaitingForResponse(t *testing.T) {
 	t.Parallel()
 
 	// Given - responder that blocks until signaled
-	proceed := make(chan struct{})
-	underlying := responder.Func[request, response](func(ctx context.Context, req request) (response, error) {
-		<-proceed
-		return response{}, nil
-	})
-	p, err := responder.NewProxy(underlying, responder.WithBuffer(1))
-	require.NoError(t, err)
+	var (
+		proceed  = make(chan struct{})
+		targetFn = func(ctx context.Context, req request) (response, error) {
+			<-proceed
+			return response{}, nil
+		}
+		p = responder.NewProxy(responder.Func(targetFn), responder.WithBuffer(1))
+	)
 
 	// When
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err = p.Respond(ctx, request{})
+	_, err := p.Respond(ctx, request{})
 
 	// Then
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "context done")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
 
 	// Cleanup
 	close(proceed)
-	_ = p.Close(context.Background())
+	_ = p.Close()
 }
 
 func Test_Proxy_CloseDrainsBufferedRequests(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	var count atomic.Uint32
-	underlying := responder.Func[request, response](func(ctx context.Context, req request) (response, error) {
-		count.Add(1)
-		return response{}, nil
-	})
-	p, err := responder.NewProxy(underlying, responder.WithBuffer(10))
-	require.NoError(t, err)
+	var (
+		count    atomic.Uint32
+		targetFn = func(ctx context.Context, req request) (response, error) {
+			count.Add(1)
+			return response{}, nil
+		}
+		p  = responder.NewProxy(responder.Func(targetFn), responder.WithBuffer(10))
+		wg sync.WaitGroup
+	)
 
 	// When - send multiple requests
-	var wg sync.WaitGroup
 	for range 5 {
 		wg.Go(func() {
 			_, _ = p.Respond(context.Background(), request{})
@@ -387,7 +422,7 @@ func Test_Proxy_CloseDrainsBufferedRequests(t *testing.T) {
 	}
 
 	wg.Wait()
-	closeErr := p.Close(context.Background())
+	closeErr := p.Close()
 
 	// Then - all requests should be processed
 	assert.NoError(t, closeErr)
@@ -398,18 +433,18 @@ func Test_Proxy_CloseWithInFlightRequests(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	started := make(chan struct{})
-	proceed := make(chan struct{})
-	var count atomic.Uint32
-
-	underlying := responder.Func[request, response](func(ctx context.Context, req request) (response, error) {
-		count.Add(1)
-		close(started)
-		<-proceed
-		return response{}, nil
-	})
-	p, err := responder.NewProxy(underlying, responder.WithBuffer(1))
-	require.NoError(t, err)
+	var (
+		started  = make(chan struct{})
+		proceed  = make(chan struct{})
+		count    atomic.Uint32
+		targetFn = func(ctx context.Context, req request) (response, error) {
+			count.Add(1)
+			close(started)
+			<-proceed
+			return response{}, nil
+		}
+		p = responder.NewProxy(responder.Func(targetFn), responder.WithBuffer(1))
+	)
 
 	// When - start a request that blocks
 	go func() {
@@ -420,7 +455,7 @@ func Test_Proxy_CloseWithInFlightRequests(t *testing.T) {
 	// Close in background
 	closeDone := make(chan error)
 	go func() {
-		closeDone <- p.Close(context.Background())
+		closeDone <- p.Close()
 	}()
 
 	// Let the request complete
@@ -443,7 +478,7 @@ func Test_Proxy_WorkerExhaustion(t *testing.T) {
 	var maxInFlight atomic.Int32
 	ready := make(chan struct{}, 3)
 
-	underlying := responder.Func[request, response](func(ctx context.Context, req request) (response, error) {
+	target := responder.Func(func(ctx context.Context, req request) (response, error) {
 		current := inFlight.Add(1)
 		for {
 			old := maxInFlight.Load()
@@ -456,11 +491,11 @@ func Test_Proxy_WorkerExhaustion(t *testing.T) {
 		inFlight.Add(-1)
 		return response{}, nil
 	})
-	p, err := responder.NewProxy(underlying,
+	p := responder.NewProxy(
+		target,
 		responder.WithBuffer(10),
 		responder.WithBoundConcurrency(2),
 	)
-	require.NoError(t, err)
 
 	// When - send 3 requests concurrently
 	var wg sync.WaitGroup
@@ -481,24 +516,26 @@ func Test_Proxy_WorkerExhaustion(t *testing.T) {
 	// Cleanup
 	close(blocker)
 	wg.Wait()
-	_ = p.Close(context.Background())
+	_ = p.Close()
 }
 
 func Test_Proxy_SemaphoreAcquisitionCancelledByContext(t *testing.T) {
 	t.Parallel()
 
 	// Given - 1 worker, block it
-	blocker := make(chan struct{})
-	done := make(chan struct{})
-	underlying := responder.Func[request, response](func(ctx context.Context, req request) (response, error) {
-		<-blocker
-		return response{}, nil
-	})
-	p, err := responder.NewProxy(underlying,
-		responder.WithBuffer(10),
-		responder.WithBoundConcurrency(1),
+	var (
+		blocker  = make(chan struct{})
+		done     = make(chan struct{})
+		targetFn = func(ctx context.Context, req request) (response, error) {
+			<-blocker
+			return response{}, nil
+		}
+		p = responder.NewProxy(
+			responder.Func(targetFn),
+			responder.WithBuffer(10),
+			responder.WithBoundConcurrency(1),
+		)
 	)
-	require.NoError(t, err)
 
 	// Start first request to occupy the worker
 	go func() {
@@ -510,30 +547,34 @@ func Test_Proxy_SemaphoreAcquisitionCancelledByContext(t *testing.T) {
 	// When - second request with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err = p.Respond(ctx, request{})
+	_, err := p.Respond(ctx, request{})
 
 	// Then - should fail due to context timeout while waiting for semaphore
-	assert.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
 
 	// Cleanup - unblock and wait
 	close(blocker)
 	<-done
-	_ = p.Close(context.Background())
+	_ = p.Close()
 }
 
 func Test_Proxy_CloseContextTimeout(t *testing.T) {
 	t.Parallel()
 
 	// Given - responder that blocks until signaled
-	blocker := make(chan struct{})
-	started := make(chan struct{})
-	underlying := responder.Func[request, response](func(ctx context.Context, req request) (response, error) {
-		close(started)
-		<-blocker
-		return response{}, nil
-	})
-	p, err := responder.NewProxy(underlying, responder.WithBuffer(1))
-	require.NoError(t, err)
+	var (
+		blocker  = make(chan struct{})
+		started  = make(chan struct{})
+		targetFn = func(ctx context.Context, req request) (response, error) {
+			close(started)
+			<-blocker
+			return response{}, nil
+		}
+		target           = responder.Func(targetFn)
+		p                = responder.NewProxy(target, responder.WithBuffer(1))
+		drainCtx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	)
+	defer cancel()
 
 	// Start a blocking request
 	go func() {
@@ -542,13 +583,29 @@ func Test_Proxy_CloseContextTimeout(t *testing.T) {
 	<-started // wait for request to start processing
 
 	// When - close with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	closeErr := p.Close(ctx)
+	closeErr := p.Close()
+	var drainErr error
+
+	select {
+	case <-drainCtx.Done():
+		drainErr = drainCtx.Err()
+	case <-p.Drained():
+	}
 
 	// Then
-	assert.Error(t, closeErr)
-	assert.Contains(t, closeErr.Error(), "context done")
+	require.NoError(t, closeErr)
+	assert.ErrorIs(t, drainErr, context.DeadlineExceeded)
 
 	close(blocker)
+}
+
+type (
+	mock     struct{ count atomic.Uint32 }
+	request  struct{}
+	response struct{}
+)
+
+func (m *mock) Respond(context.Context, request) (response, error) {
+	m.count.Add(1)
+	return response{}, nil
 }

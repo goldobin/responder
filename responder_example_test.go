@@ -23,7 +23,7 @@ type (
 	KVPutResponse struct{}
 )
 
-// KVService is the underlying service interface
+// KVService is the target service interface
 type KVService interface {
 	Get(ctx context.Context, req KVGetRequest) (KVGetResponse, error)
 	Put(ctx context.Context, req KVPutRequest) (KVPutResponse, error)
@@ -58,30 +58,22 @@ type KVServiceProxy struct {
 	putProxy *responder.Proxy[KVPutRequest, KVPutResponse]
 }
 
-func NewKVServiceProxy(svc KVService) (*KVServiceProxy, error) {
+func NewKVServiceProxy(svc KVService) *KVServiceProxy {
 	opts := []responder.Option{
 		responder.WithBuffer(10),
 		responder.WithBoundConcurrency(2),
 	}
 
-	getResponder := responder.Func[KVGetRequest, KVGetResponse](svc.Get)
-	putResponder := responder.Func[KVPutRequest, KVPutResponse](svc.Put)
+	getResponder := responder.Func(svc.Get)
+	putResponder := responder.Func(svc.Put)
 
-	getProxy, err := responder.NewProxy(getResponder, opts...)
-	if err != nil {
-		return nil, err
-	}
-
-	putProxy, err := responder.NewProxy(putResponder, opts...)
-	if err != nil {
-		_ = getProxy.Close(context.Background())
-		return nil, err
-	}
+	getProxy := responder.NewProxy(getResponder, opts...)
+	putProxy := responder.NewProxy(putResponder, opts...)
 
 	return &KVServiceProxy{
 		getProxy: getProxy,
 		putProxy: putProxy,
-	}, nil
+	}
 }
 
 func (p *KVServiceProxy) Get(ctx context.Context, req KVGetRequest) (KVGetResponse, error) {
@@ -92,9 +84,9 @@ func (p *KVServiceProxy) Put(ctx context.Context, req KVPutRequest) (KVPutRespon
 	return p.putProxy.Respond(ctx, req)
 }
 
-func (p *KVServiceProxy) Close(ctx context.Context) error {
-	getErr := p.getProxy.Close(ctx)
-	putErr := p.putProxy.Close(ctx)
+func (p *KVServiceProxy) Close() error {
+	getErr := p.getProxy.Close()
+	putErr := p.putProxy.Close()
 	if getErr != nil {
 		return getErr
 	}
@@ -107,14 +99,13 @@ func Test_KVServiceProxy(t *testing.T) {
 	// Given
 	ctx := context.Background()
 	kv := NewInMemoryKV()
-	proxy, err := NewKVServiceProxy(kv)
-	require.NoError(t, err)
+	proxy := NewKVServiceProxy(kv)
 	defer func() {
-		_ = proxy.Close(ctx)
+		_ = proxy.Close()
 	}()
 
 	// When - Put values
-	_, err = proxy.Put(ctx, KVPutRequest{Key: "foo", Value: "bar"})
+	_, err := proxy.Put(ctx, KVPutRequest{Key: "foo", Value: "bar"})
 	assert.NoError(t, err)
 
 	_, err = proxy.Put(ctx, KVPutRequest{Key: "hello", Value: "world"})
@@ -135,19 +126,30 @@ func Test_KVServiceProxy(t *testing.T) {
 	assert.Equal(t, "", resp3.Value)
 }
 
+func Test_KVServiceProxy_New(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	kv := NewInMemoryKV()
+
+	// When
+	proxy := NewKVServiceProxy(kv)
+
+	// Then
+	require.NotNil(t, proxy)
+	_ = proxy.Close()
+}
+
 func Example_kvServiceProxy() {
 	ctx := context.Background()
 
-	// Create underlying service
+	// Create target service
 	kv := NewInMemoryKV()
 
 	// Create buffered service proxy
-	proxy, err := NewKVServiceProxy(kv)
-	if err != nil {
-		panic(err)
-	}
+	proxy := NewKVServiceProxy(kv)
 	defer func() {
-		_ = proxy.Close(ctx)
+		_ = proxy.Close()
 	}()
 
 	// Put some values
