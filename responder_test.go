@@ -125,7 +125,6 @@ func Test_FanOutError(t *testing.T) {
 	responses, err := fanOut.Respond(context.Background(), request{})
 
 	// Then - all responders called, errors joined
-	require.Error(t, err)
 	assert.ErrorIs(t, err, err1)
 	assert.ErrorIs(t, err, err2)
 	assert.Len(t, responses, 4)
@@ -174,13 +173,19 @@ func Test_Proxy(t *testing.T) {
 			numRequests: 1,
 		},
 		{
-			name:        "buffer size 10, with semaphore weight 1",
-			opts:        []responder.Option{responder.WithBuffer(10), responder.WithSemaphore(semaphore.NewWeighted(5), 1)},
+			name: "buffer size 10, with semaphore weight 1",
+			opts: []responder.Option{
+				responder.WithBuffer(10),
+				responder.WithSemaphore(semaphore.NewWeighted(5), 1),
+			},
 			numRequests: 5,
 		},
 		{
-			name:        "buffer size 10, with semaphore weight 2",
-			opts:        []responder.Option{responder.WithBuffer(10), responder.WithSemaphore(semaphore.NewWeighted(10), 2)},
+			name: "buffer size 10, with semaphore weight 2",
+			opts: []responder.Option{
+				responder.WithBuffer(10),
+				responder.WithSemaphore(semaphore.NewWeighted(10), 2),
+			},
 			numRequests: 5,
 		},
 		{
@@ -194,13 +199,19 @@ func Test_Proxy(t *testing.T) {
 			numRequests: 5,
 		},
 		{
-			name:        "buffer size 10, bound concurrency 1",
-			opts:        []responder.Option{responder.WithBuffer(10), responder.WithBoundConcurrency(1)},
+			name: "buffer size 10, bound concurrency 1",
+			opts: []responder.Option{
+				responder.WithBuffer(10),
+				responder.WithBoundConcurrency(1),
+			},
 			numRequests: 5,
 		},
 		{
-			name:        "buffer size 10, bound concurrency 5",
-			opts:        []responder.Option{responder.WithBuffer(10), responder.WithBoundConcurrency(5)},
+			name: "buffer size 10, bound concurrency 5",
+			opts: []responder.Option{
+				responder.WithBuffer(10),
+				responder.WithBoundConcurrency(5),
+			},
 			numRequests: 10,
 		},
 	}
@@ -603,6 +614,190 @@ func Test_Proxy_CloseContextTimeout(t *testing.T) {
 		assert.ErrorIs(t, drainErr, context.DeadlineExceeded)
 
 		close(blocker)
+	})
+}
+
+func Test_Func(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	targetFn := func(_ context.Context, req int) (string, error) {
+		return fmt.Sprintf("got:%d", req), nil
+	}
+	r := responder.Func(targetFn)
+
+	// When
+	resp, err := r.Respond(context.Background(), 42)
+
+	// Then
+	require.NoError(t, err)
+	assert.Equal(t, "got:42", resp)
+}
+
+func Test_Same(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	r := responder.Same[request]("always")
+
+	// When
+	resp, err := r.Respond(context.Background(), request{})
+
+	// Then
+	require.NoError(t, err)
+	assert.Equal(t, "always", resp)
+}
+
+func Test_Error(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	r := responder.Error[request, response](assert.AnError)
+
+	// When
+	resp, err := r.Respond(context.Background(), request{})
+
+	// Then
+	assert.ErrorIs(t, err, assert.AnError)
+	assert.Equal(t, response{}, resp)
+}
+
+func Test_FanOutEmpty(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	fanOut := responder.FanOut[request, int](nil)
+
+	// When
+	responses, err := fanOut.Respond(context.Background(), request{})
+
+	// Then
+	require.NoError(t, err)
+	assert.Empty(t, responses)
+}
+
+func Test_FanOutSingle(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	rs := []responder.Responder[request, int]{
+		responder.Func(func(context.Context, request) (int, error) {
+			return 42, nil
+		}),
+	}
+	fanOut := responder.FanOut(rs)
+
+	// When
+	responses, err := fanOut.Respond(context.Background(), request{})
+
+	// Then
+	require.NoError(t, err)
+	assert.Equal(t, []int{42}, responses)
+}
+
+func Test_Proxy_TargetError(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	var (
+		target = responder.Error[request, response](assert.AnError)
+		p      = responder.NewProxy(target)
+	)
+
+	// When
+	_, err := p.Respond(context.Background(), request{})
+
+	// Then
+	assert.ErrorIs(t, err, assert.AnError)
+
+	_ = p.Close()
+}
+
+func Test_Proxy_RequestPassthrough(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	var received atomic.Value
+	targetFn := func(_ context.Context, req int) (int, error) {
+		received.Store(req)
+		return req * 2, nil
+	}
+	p := responder.NewProxy(responder.Func(targetFn))
+
+	// When
+	resp, err := p.Respond(context.Background(), 21)
+
+	// Then
+	require.NoError(t, err)
+	assert.Equal(t, 42, resp)
+	assert.Equal(t, 21, received.Load())
+
+	_ = p.Close()
+}
+
+func Test_Proxy_DrainedAfterClose(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	p := responder.NewProxy(responder.Same[request, response](response{}))
+
+	// When
+	_ = p.Close()
+	<-p.Drained()
+
+	// Then - if we reach here, Drained() signaled
+}
+
+func Test_Proxy_UnboundConcurrencyRunsInParallel(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		// Given - 3 requests, all block until signaled
+		var (
+			blocker   = make(chan struct{})
+			inFlight  atomic.Int32
+			maxFlight atomic.Int32
+			ready     = make(chan struct{}, 3)
+			targetFn  = func(ctx context.Context, req request) (response, error) {
+				current := inFlight.Add(1)
+				for {
+					old := maxFlight.Load()
+					if current <= old || maxFlight.CompareAndSwap(old, current) {
+						break
+					}
+				}
+				ready <- struct{}{}
+				<-blocker
+				inFlight.Add(-1)
+				return response{}, nil
+			}
+			p = responder.NewProxy(
+				responder.Func(targetFn),
+				responder.WithBuffer(10),
+				responder.WithUnboundConcurrency(),
+			)
+		)
+
+		// When - send 3 requests concurrently
+		var wg sync.WaitGroup
+		for range 3 {
+			wg.Go(func() {
+				_, _ = p.Respond(context.Background(), request{})
+			})
+		}
+
+		// Wait for all 3 to be in flight
+		<-ready
+		<-ready
+		<-ready
+		time.Sleep(10 * time.Millisecond)
+
+		// Then - all 3 should be in flight simultaneously
+		assert.Equal(t, int32(3), maxFlight.Load())
+
+		// Cleanup
+		close(blocker)
+		wg.Wait()
+		_ = p.Close()
 	})
 }
 
