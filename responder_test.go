@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/goldobin/responder"
@@ -271,22 +272,23 @@ func Test_Proxy_InvalidOptions(t *testing.T) {
 
 func Test_Proxy_RespondAfterClose(t *testing.T) {
 	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		// Given
+		var (
+			target = responder.Same[request, response](response{})
+			p      = responder.NewProxy(target)
+		)
 
-	// Given
-	var (
-		target = responder.Same[request, response](response{})
-		p      = responder.NewProxy(target)
-	)
+		// When - close, then try to respond with a short timeout
+		_ = p.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		_, err := p.Respond(ctx, request{})
 
-	// When - close, then try to respond with a short timeout
-	_ = p.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	_, err := p.Respond(ctx, request{})
-
-	// Then - send on nil channel blocks, so context timeout wins
-	require.Error(t, err)
-	assert.ErrorIs(t, err, responder.Closed)
+		// Then - send on nil channel blocks, so context timeout wins
+		require.Error(t, err)
+		assert.ErrorIs(t, err, responder.Closed)
+	})
 }
 
 func Test_Proxy_ConcurrentRespondAndClose(t *testing.T) {
@@ -341,63 +343,65 @@ func Test_Proxy_DoubleClose(t *testing.T) {
 
 func Test_Proxy_ContextCancelledBeforeSend(t *testing.T) {
 	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		// Given - unbuffered channel, no reader yet
+		var (
+			blocker  = make(chan struct{})
+			done     = make(chan struct{})
+			targetFn = func(ctx context.Context, req request) (response, error) {
+				<-blocker // block forever
+				return response{}, nil
+			}
+			p = responder.NewProxy(responder.Func(targetFn)) // unbuffered
+		)
 
-	// Given - unbuffered channel, no reader yet
-	var (
-		blocker  = make(chan struct{})
-		done     = make(chan struct{})
-		targetFn = func(ctx context.Context, req request) (response, error) {
-			<-blocker // block forever
-			return response{}, nil
-		}
-		p = responder.NewProxy(responder.Func(targetFn)) // unbuffered
-	)
+		// Start one request to block the worker
+		go func() {
+			defer close(done)
+			_, _ = p.Respond(context.Background(), request{})
+		}()
+		time.Sleep(10 * time.Millisecond) // let it block
 
-	// Start one request to block the worker
-	go func() {
-		defer close(done)
-		_, _ = p.Respond(context.Background(), request{})
-	}()
-	time.Sleep(10 * time.Millisecond) // let it block
+		// When - try to send with already canceled context
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := p.Respond(ctx, request{})
 
-	// When - try to send with already canceled context
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := p.Respond(ctx, request{})
+		// Then
+		assert.ErrorIs(t, err, context.Canceled)
 
-	// Then
-	assert.ErrorIs(t, err, context.Canceled)
-
-	// Cleanup - unblock and wait
-	close(blocker)
-	<-done
-	_ = p.Close()
+		// Cleanup - unblock and wait
+		close(blocker)
+		<-done
+		_ = p.Close()
+	})
 }
 
 func Test_Proxy_ContextCancelledWhileWaitingForResponse(t *testing.T) {
 	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		// Given - responder that blocks until signaled
+		var (
+			proceed  = make(chan struct{})
+			targetFn = func(ctx context.Context, req request) (response, error) {
+				<-proceed
+				return response{}, nil
+			}
+			p = responder.NewProxy(responder.Func(targetFn), responder.WithBuffer(1))
+		)
 
-	// Given - responder that blocks until signaled
-	var (
-		proceed  = make(chan struct{})
-		targetFn = func(ctx context.Context, req request) (response, error) {
-			<-proceed
-			return response{}, nil
-		}
-		p = responder.NewProxy(responder.Func(targetFn), responder.WithBuffer(1))
-	)
+		// When
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		_, err := p.Respond(ctx, request{})
 
-	// When
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	_, err := p.Respond(ctx, request{})
+		// Then
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
 
-	// Then
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
-
-	// Cleanup
-	close(proceed)
-	_ = p.Close()
+		// Cleanup
+		close(proceed)
+		_ = p.Close()
+	})
 }
 
 func Test_Proxy_CloseDrainsBufferedRequests(t *testing.T) {
@@ -471,132 +475,135 @@ func Test_Proxy_CloseWithInFlightRequests(t *testing.T) {
 
 func Test_Proxy_WorkerExhaustion(t *testing.T) {
 	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		// Given - 2 workers, 3 requests
+		blocker := make(chan struct{})
+		var inFlight atomic.Int32
+		var maxInFlight atomic.Int32
+		ready := make(chan struct{}, 3)
 
-	// Given - 2 workers, 3 requests
-	blocker := make(chan struct{})
-	var inFlight atomic.Int32
-	var maxInFlight atomic.Int32
-	ready := make(chan struct{}, 3)
-
-	target := responder.Func(func(ctx context.Context, req request) (response, error) {
-		current := inFlight.Add(1)
-		for {
-			old := maxInFlight.Load()
-			if current <= old || maxInFlight.CompareAndSwap(old, current) {
-				break
+		target := responder.Func(func(ctx context.Context, req request) (response, error) {
+			current := inFlight.Add(1)
+			for {
+				old := maxInFlight.Load()
+				if current <= old || maxInFlight.CompareAndSwap(old, current) {
+					break
+				}
 			}
-		}
-		ready <- struct{}{}
-		<-blocker
-		inFlight.Add(-1)
-		return response{}, nil
-	})
-	p := responder.NewProxy(
-		target,
-		responder.WithBuffer(10),
-		responder.WithBoundConcurrency(2),
-	)
-
-	// When - send 3 requests concurrently
-	var wg sync.WaitGroup
-	for range 3 {
-		wg.Go(func() {
-			_, _ = p.Respond(context.Background(), request{})
+			ready <- struct{}{}
+			<-blocker
+			inFlight.Add(-1)
+			return response{}, nil
 		})
-	}
+		p := responder.NewProxy(
+			target,
+			responder.WithBuffer(10),
+			responder.WithBoundConcurrency(2),
+		)
 
-	// Wait for 2 workers to be busy (third will be waiting for semaphore)
-	<-ready
-	<-ready
-	time.Sleep(10 * time.Millisecond) // small wait for stability
+		// When - send 3 requests concurrently
+		var wg sync.WaitGroup
+		for range 3 {
+			wg.Go(func() {
+				_, _ = p.Respond(context.Background(), request{})
+			})
+		}
 
-	// Then - max 2 should be in flight
-	assert.Equal(t, int32(2), maxInFlight.Load())
+		// Wait for 2 workers to be busy (third will be waiting for semaphore)
+		<-ready
+		<-ready
+		time.Sleep(10 * time.Millisecond) // small wait for stability
 
-	// Cleanup
-	close(blocker)
-	wg.Wait()
-	_ = p.Close()
+		// Then - max 2 should be in flight
+		assert.Equal(t, int32(2), maxInFlight.Load())
+
+		// Cleanup
+		close(blocker)
+		wg.Wait()
+		_ = p.Close()
+	})
 }
 
 func Test_Proxy_SemaphoreAcquisitionCancelledByContext(t *testing.T) {
 	t.Parallel()
-
-	// Given - 1 worker, block it
-	var (
-		blocker  = make(chan struct{})
-		done     = make(chan struct{})
-		targetFn = func(ctx context.Context, req request) (response, error) {
-			<-blocker
-			return response{}, nil
-		}
-		p = responder.NewProxy(
-			responder.Func(targetFn),
-			responder.WithBuffer(10),
-			responder.WithBoundConcurrency(1),
+	synctest.Test(t, func(t *testing.T) {
+		// Given - 1 worker, block it
+		var (
+			blocker  = make(chan struct{})
+			done     = make(chan struct{})
+			targetFn = func(ctx context.Context, req request) (response, error) {
+				<-blocker
+				return response{}, nil
+			}
+			p = responder.NewProxy(
+				responder.Func(targetFn),
+				responder.WithBuffer(10),
+				responder.WithBoundConcurrency(1),
+			)
 		)
-	)
 
-	// Start first request to occupy the worker
-	go func() {
-		defer close(done)
-		_, _ = p.Respond(context.Background(), request{})
-	}()
-	time.Sleep(10 * time.Millisecond)
+		// Start first request to occupy the worker
+		go func() {
+			defer close(done)
+			_, _ = p.Respond(context.Background(), request{})
+		}()
+		time.Sleep(10 * time.Millisecond)
 
-	// When - second request with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	_, err := p.Respond(ctx, request{})
+		// When - second request with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		_, err := p.Respond(ctx, request{})
 
-	// Then - should fail due to context timeout while waiting for semaphore
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
+		// Then - should fail due to context timeout while waiting for semaphore
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
 
-	// Cleanup - unblock and wait
-	close(blocker)
-	<-done
-	_ = p.Close()
+		// Cleanup - unblock and wait
+		close(blocker)
+		<-done
+		_ = p.Close()
+	})
 }
 
 func Test_Proxy_CloseContextTimeout(t *testing.T) {
 	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		// Given - responder that blocks until signaled
+		var (
+			blocker  = make(chan struct{})
+			started  = make(chan struct{})
+			targetFn = func(ctx context.Context, req request) (response, error) {
+				close(started)
+				<-blocker
+				return response{}, nil
+			}
+			target           = responder.Func(targetFn)
+			p                = responder.NewProxy(target, responder.WithBuffer(1))
+			drainCtx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+		)
+		defer cancel()
 
-	// Given - responder that blocks until signaled
-	var (
-		blocker  = make(chan struct{})
-		started  = make(chan struct{})
-		targetFn = func(ctx context.Context, req request) (response, error) {
-			close(started)
-			<-blocker
-			return response{}, nil
+		// Start a blocking request
+		go func() {
+			_, _ = p.Respond(context.Background(), request{})
+		}()
+		<-started // wait for request to start processing
+
+		// When - close with timeout
+		closeErr := p.Close()
+		var drainErr error
+
+		select {
+		case <-drainCtx.Done():
+			drainErr = drainCtx.Err()
+		case <-p.Drained():
 		}
-		target           = responder.Func(targetFn)
-		p                = responder.NewProxy(target, responder.WithBuffer(1))
-		drainCtx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
-	)
-	defer cancel()
 
-	// Start a blocking request
-	go func() {
-		_, _ = p.Respond(context.Background(), request{})
-	}()
-	<-started // wait for request to start processing
+		// Then
+		require.NoError(t, closeErr)
+		assert.ErrorIs(t, drainErr, context.DeadlineExceeded)
 
-	// When - close with timeout
-	closeErr := p.Close()
-	var drainErr error
-
-	select {
-	case <-drainCtx.Done():
-		drainErr = drainCtx.Err()
-	case <-p.Drained():
-	}
-
-	// Then
-	require.NoError(t, closeErr)
-	assert.ErrorIs(t, drainErr, context.DeadlineExceeded)
-
-	close(blocker)
+		close(blocker)
+	})
 }
 
 type (
