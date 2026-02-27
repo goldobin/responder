@@ -59,8 +59,8 @@ func newKVServiceProxy(svc kvService) *kvServiceProxy {
 		responder.WithBoundConcurrency(2),
 	}
 
-	getProxy := responder.NewProxy(responder.Func(svc.get), opts...)
-	putProxy := responder.NewProxy(responder.Func(svc.put), opts...)
+	getProxy := responder.NewProxyWithTarget(responder.Func(svc.get), opts...)
+	putProxy := responder.NewProxyWithTarget(responder.Func(svc.put), opts...)
 
 	return &kvServiceProxy{
 		getProxy: getProxy,

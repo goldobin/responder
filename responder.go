@@ -12,8 +12,6 @@ type (
 	responderFn[T any, R any] func(context.Context, T) (R, error)
 )
 
-var Panicked = errors.New("panicked")
-
 func (f responderFn[T, R]) Respond(ctx context.Context, req T) (R, error) {
 	return f(ctx, req)
 }

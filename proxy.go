@@ -34,21 +34,26 @@ type (
 	}
 )
 
-var Closed = errors.New("closed")
-
-func NewProxy[T any, R any](target Responder[T, R], opts ...Option) *Proxy[T, R] {
+func NewProxy[T any, R any](opts ...Option) *Proxy[T, R] {
 	var cfg options
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 
-	requests := make(chan requestEnvelope[T, R], cfg.buffSize)
-	drained := make(chan struct{})
-	respond := func(req requestEnvelope[T, R]) {
-		var resp responseEnvelope[R]
-		resp.resp, resp.err = target.Respond(req.ctx, req.req)
-		req.respCh <- resp
-	}
+	var (
+		p        Proxy[T, R]
+		requests = make(chan requestEnvelope[T, R], cfg.buffSize)
+		drained  = make(chan struct{})
+		respond  = func(req requestEnvelope[T, R]) {
+			var resp responseEnvelope[R]
+			if p.target == nil {
+				resp.err = NoTarget
+			} else {
+				resp.resp, resp.err = p.target.Respond(req.ctx, req.req)
+			}
+			req.respCh <- resp
+		}
+	)
 
 	go func() {
 		defer close(drained)
@@ -78,11 +83,15 @@ func NewProxy[T any, R any](target Responder[T, R], opts ...Option) *Proxy[T, R]
 		}
 	}()
 
-	return &Proxy[T, R]{
-		requests: requests,
-		target:   target,
-		drained:  drained,
-	}
+	p.requests = requests
+	p.drained = drained
+	return &p
+}
+
+func NewProxyWithTarget[T any, R any](target Responder[T, R], opts ...Option) *Proxy[T, R] {
+	p := NewProxy[T, R](opts...)
+	p.SetTarget(target)
+	return p
 }
 
 func (p *Proxy[T, R]) Respond(ctx context.Context, req T) (R, error) {
@@ -100,6 +109,10 @@ func (p *Proxy[T, R]) Respond(ctx context.Context, req T) (R, error) {
 	case resp := <-respCh:
 		return resp.resp, resp.err
 	}
+}
+
+func (p *Proxy[T, R]) SetTarget(target Responder[T, R]) {
+	p.target = target
 }
 
 func (p *Proxy[T, R]) Close() error {

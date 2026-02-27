@@ -109,7 +109,7 @@ func Test_Proxy(t *testing.T) {
 			ctx := context.Background()
 
 			// When
-			p := responder.NewProxy[request, response](&m, tt.opts...)
+			p := responder.NewProxyWithTarget[request, response](&m, tt.opts...)
 
 			for i := 0; i < tt.numRequests; i++ {
 				_, respErr := p.Respond(ctx, request{})
@@ -159,10 +159,25 @@ func Test_Proxy_InvalidOptions(t *testing.T) {
 			t.Parallel()
 
 			assert.Panics(t, func() {
-				responder.NewProxy(responder.Same[request, response](response{}), tt.opts...)
+				responder.NewProxy[request, response](tt.opts...)
 			})
 		})
 	}
+}
+
+func Test_Proxy_NoTarget(t *testing.T) {
+	t.Parallel()
+
+	// Given - proxy without a target set
+	p := responder.NewProxy[request, response]()
+
+	// When
+	_, err := p.Respond(context.Background(), request{})
+
+	// Then
+	assert.ErrorIs(t, err, responder.NoTarget)
+
+	_ = p.Close()
 }
 
 func Test_Proxy_RespondAfterClose(t *testing.T) {
@@ -170,8 +185,8 @@ func Test_Proxy_RespondAfterClose(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		// Given
 		var (
-			target = responder.Same[request, response](response{})
-			p      = responder.NewProxy(target)
+			target = responder.Same[request](response{})
+			p      = responder.NewProxyWithTarget(target)
 		)
 
 		// When - close, then try to respond with a short timeout
@@ -195,16 +210,17 @@ func Test_Proxy_ConcurrentRespondAndClose(t *testing.T) {
 		iterations  = 10
 		parallelism = 10
 		targetFn    = func(context.Context, request) (response, error) { return response{}, nil }
-		target      = responder.Func(targetFn)
 	)
 
 	// When
 	for ri := 0; ri < runs; ri++ {
 		t.Run(fmt.Sprintf("run %d", ri), func(t *testing.T) {
-			var wg sync.WaitGroup
+			var (
+				p  = responder.NewProxyWithTarget(responder.Func(targetFn), responder.WithBuffer(5))
+				wg sync.WaitGroup
+			)
 			defer wg.Wait()
 
-			p := responder.NewProxy(target, responder.WithBuffer(5))
 			for i := 0; i < parallelism; i++ {
 				wg.Go(func() {
 					for j := 0; j < iterations; j++ {
@@ -225,7 +241,7 @@ func Test_Proxy_DoubleClose(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	p := responder.NewProxy(responder.Same[request, response](response{}))
+	p := responder.NewProxyWithTarget(responder.Same[request, response](response{}))
 
 	// When
 	err1 := p.Close()
@@ -247,7 +263,7 @@ func Test_Proxy_ContextCancelledBeforeSend(t *testing.T) {
 				<-blocker // block forever
 				return response{}, nil
 			}
-			p = responder.NewProxy(responder.Func(targetFn)) // unbuffered
+			p = responder.NewProxyWithTarget(responder.Func(targetFn)) // unbuffered
 		)
 
 		// Start one request to block the worker
@@ -282,7 +298,7 @@ func Test_Proxy_ContextCancelledWhileWaitingForResponse(t *testing.T) {
 				<-proceed
 				return response{}, nil
 			}
-			p = responder.NewProxy(responder.Func(targetFn), responder.WithBuffer(1))
+			p = responder.NewProxyWithTarget(responder.Func(targetFn), responder.WithBuffer(1))
 		)
 
 		// When
@@ -309,7 +325,7 @@ func Test_Proxy_CloseDrainsBufferedRequests(t *testing.T) {
 			count.Add(1)
 			return response{}, nil
 		}
-		p  = responder.NewProxy(responder.Func(targetFn), responder.WithBuffer(10))
+		p  = responder.NewProxyWithTarget(responder.Func(targetFn), responder.WithBuffer(10))
 		wg sync.WaitGroup
 	)
 
@@ -342,7 +358,7 @@ func Test_Proxy_CloseWithInFlightRequests(t *testing.T) {
 			<-proceed
 			return response{}, nil
 		}
-		p = responder.NewProxy(responder.Func(targetFn), responder.WithBuffer(1))
+		p = responder.NewProxyWithTarget(responder.Func(targetFn), responder.WithBuffer(1))
 	)
 
 	// When - start a request that blocks
@@ -370,32 +386,34 @@ func Test_Proxy_WorkerExhaustion(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		// Given - 2 workers, 3 requests
-		blocker := make(chan struct{})
-		var inFlight atomic.Int32
-		var maxInFlight atomic.Int32
-		ready := make(chan struct{}, 3)
-
-		target := responder.Func(func(ctx context.Context, req request) (response, error) {
-			current := inFlight.Add(1)
-			for {
-				old := maxInFlight.Load()
-				if current <= old || maxInFlight.CompareAndSwap(old, current) {
-					break
+		var (
+			blocker     = make(chan struct{})
+			inFlight    atomic.Int32
+			maxInFlight atomic.Int32
+			ready       = make(chan struct{}, 3)
+			targetFn    = func(ctx context.Context, req request) (response, error) {
+				current := inFlight.Add(1)
+				for {
+					old := maxInFlight.Load()
+					if current <= old || maxInFlight.CompareAndSwap(old, current) {
+						break
+					}
 				}
+				ready <- struct{}{}
+				<-blocker
+				inFlight.Add(-1)
+				return response{}, nil
 			}
-			ready <- struct{}{}
-			<-blocker
-			inFlight.Add(-1)
-			return response{}, nil
-		})
-		p := responder.NewProxy(
-			target,
-			responder.WithBuffer(10),
-			responder.WithBoundConcurrency(2),
+			p = responder.NewProxyWithTarget(
+				responder.Func(targetFn),
+				responder.WithBuffer(10),
+				responder.WithBoundConcurrency(2),
+			)
+			wg sync.WaitGroup
 		)
 
 		// When - send 3 requests concurrently
-		var wg sync.WaitGroup
+
 		for range 3 {
 			wg.Go(func() {
 				_, _ = p.Respond(context.Background(), request{})
@@ -428,7 +446,7 @@ func Test_Proxy_SemaphoreAcquisitionCancelledByContext(t *testing.T) {
 				<-blocker
 				return response{}, nil
 			}
-			p = responder.NewProxy(
+			p = responder.NewProxyWithTarget(
 				responder.Func(targetFn),
 				responder.WithBuffer(10),
 				responder.WithBoundConcurrency(1),
@@ -469,8 +487,7 @@ func Test_Proxy_CloseContextTimeout(t *testing.T) {
 				<-blocker
 				return response{}, nil
 			}
-			target           = responder.Func(targetFn)
-			p                = responder.NewProxy(target, responder.WithBuffer(1))
+			p                = responder.NewProxyWithTarget(responder.Func(targetFn), responder.WithBuffer(1))
 			drainCtx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
 		)
 		defer cancel()
@@ -505,7 +522,7 @@ func Test_Proxy_TargetError(t *testing.T) {
 	// Given
 	var (
 		target = responder.Error[request, response](assert.AnError)
-		p      = responder.NewProxy(target)
+		p      = responder.NewProxyWithTarget(target)
 	)
 
 	// When
@@ -521,12 +538,14 @@ func Test_Proxy_RequestPassthrough(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	var received atomic.Value
-	targetFn := func(_ context.Context, req int) (int, error) {
-		received.Store(req)
-		return req * 2, nil
-	}
-	p := responder.NewProxy(responder.Func(targetFn))
+	var (
+		received atomic.Value
+		targetFn = func(_ context.Context, req int) (int, error) {
+			received.Store(req)
+			return req * 2, nil
+		}
+		p = responder.NewProxyWithTarget(responder.Func(targetFn))
+	)
 
 	// When
 	resp, err := p.Respond(context.Background(), 21)
@@ -543,7 +562,7 @@ func Test_Proxy_DrainedAfterClose(t *testing.T) {
 	t.Parallel()
 
 	// Given
-	p := responder.NewProxy(responder.Same[request, response](response{}))
+	p := responder.NewProxyWithTarget(responder.Same[request, response](response{}))
 
 	// When
 	_ = p.Close()
@@ -574,7 +593,7 @@ func Test_Proxy_UnboundConcurrencyRunsInParallel(t *testing.T) {
 				inFlight.Add(-1)
 				return response{}, nil
 			}
-			p = responder.NewProxy(
+			p = responder.NewProxyWithTarget(
 				responder.Func(targetFn),
 				responder.WithBuffer(10),
 				responder.WithUnboundConcurrency(),
