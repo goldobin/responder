@@ -13,6 +13,7 @@ type (
 	Proxy[T any, R any] struct {
 		requestsMu sync.RWMutex
 		requests   chan<- requestEnvelope[T, R]
+		targetMu   sync.RWMutex
 		target     Responder[T, R]
 		drained    <-chan struct{}
 	}
@@ -45,11 +46,15 @@ func NewProxy[T any, R any](opts ...Option) *Proxy[T, R] {
 		requests = make(chan requestEnvelope[T, R], cfg.buffSize)
 		drained  = make(chan struct{})
 		respond  = func(req requestEnvelope[T, R]) {
-			var resp responseEnvelope[R]
-			if p.target == nil {
+			var (
+				resp responseEnvelope[R]
+				t    = p.Target()
+			)
+
+			if t == nil {
 				resp.err = NoTarget
 			} else {
-				resp.resp, resp.err = p.target.Respond(req.ctx, req.req)
+				resp.resp, resp.err = t.Respond(req.ctx, req.req)
 			}
 			req.respCh <- resp
 		}
@@ -112,7 +117,15 @@ func (p *Proxy[T, R]) Respond(ctx context.Context, req T) (R, error) {
 }
 
 func (p *Proxy[T, R]) SetTarget(target Responder[T, R]) {
+	p.targetMu.Lock()
+	defer p.targetMu.Unlock()
 	p.target = target
+}
+
+func (p *Proxy[T, R]) Target() Responder[T, R] {
+	p.targetMu.RLock()
+	defer p.targetMu.RUnlock()
+	return p.target
 }
 
 func (p *Proxy[T, R]) Close() error {

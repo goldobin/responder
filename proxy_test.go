@@ -111,7 +111,7 @@ func Test_Proxy(t *testing.T) {
 			// When
 			p := responder.NewProxyWithTarget[request, response](&m, tt.opts...)
 
-			for i := 0; i < tt.numRequests; i++ {
+			for range tt.numRequests {
 				_, respErr := p.Respond(ctx, request{})
 				assert.NoError(t, respErr)
 			}
@@ -221,9 +221,9 @@ func Test_Proxy_ConcurrentRespondAndClose(t *testing.T) {
 			)
 			defer wg.Wait()
 
-			for i := 0; i < parallelism; i++ {
+			for range parallelism {
 				wg.Go(func() {
-					for j := 0; j < iterations; j++ {
+					for range iterations {
 						_, _ = p.Respond(context.Background(), request{})
 					}
 				})
@@ -622,4 +622,117 @@ func Test_Proxy_UnboundConcurrencyRunsInParallel(t *testing.T) {
 		wg.Wait()
 		_ = p.Close()
 	})
+}
+
+func Test_Proxy_SetTargetConcurrentWithRespond(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	var (
+		target1 = responder.Func(func(_ context.Context, req request) (response, error) {
+			return response{}, nil
+		})
+		target2 = responder.Func(func(_ context.Context, req request) (response, error) {
+			return response{}, nil
+		})
+		p  = responder.NewProxyWithTarget(target1, responder.WithBuffer(10), responder.WithUnboundConcurrency())
+		wg sync.WaitGroup
+	)
+
+	// When - SetTarget and Respond race against each other
+	for range 100 {
+		wg.Go(func() {
+			p.SetTarget(target2)
+		})
+		wg.Go(func() {
+			_, _ = p.Respond(context.Background(), request{})
+		})
+	}
+
+	wg.Wait()
+	_ = p.Close()
+}
+
+func Test_Proxy_SetTargetConcurrentWithSetTarget(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	var (
+		targets [10]responder.Responder[request, response]
+		p       = responder.NewProxy[request, response](responder.WithBuffer(10))
+		wg      sync.WaitGroup
+	)
+	for i := range targets {
+		targets[i] = responder.Same[request](response{})
+	}
+
+	// When - multiple goroutines race to set targets
+	for _, target := range targets {
+		wg.Go(func() {
+			p.SetTarget(target)
+		})
+	}
+
+	wg.Wait()
+	_ = p.Close()
+}
+
+func Test_Proxy_SetTargetWhileProcessing(t *testing.T) {
+	t.Parallel()
+
+	// Given - a slow target so requests are in-flight during SetTarget
+	var (
+		blocker = make(chan struct{})
+		count   atomic.Uint32
+		slow    = responder.Func(func(_ context.Context, req request) (response, error) {
+			count.Add(1)
+			<-blocker
+			return response{}, nil
+		})
+		fast = responder.Func(func(_ context.Context, req request) (response, error) {
+			count.Add(1)
+			return response{}, nil
+		})
+		p  = responder.NewProxyWithTarget(slow, responder.WithBuffer(10), responder.WithUnboundConcurrency())
+		wg sync.WaitGroup
+	)
+
+	// When - start requests that block, then swap to fast target
+	for range 5 {
+		wg.Go(func() {
+			_, _ = p.Respond(context.Background(), request{})
+		})
+	}
+
+	// Swap target while slow requests are in flight
+	p.SetTarget(fast)
+
+	// Unblock slow requests
+	close(blocker)
+	wg.Wait()
+
+	// Then - all requests should complete without race
+	assert.GreaterOrEqual(t, count.Load(), uint32(5))
+	_ = p.Close()
+}
+
+func Test_Proxy_SetTargetFromNil(t *testing.T) {
+	t.Parallel()
+
+	// Given - proxy starts without a target
+	var (
+		p  = responder.NewProxy[request, response](responder.WithBuffer(10))
+		wg sync.WaitGroup
+	)
+
+	// When - one goroutine sets the target while others try to respond
+	for range 50 {
+		wg.Go(func() {
+			_, _ = p.Respond(context.Background(), request{})
+		})
+	}
+
+	p.SetTarget(responder.Same[request](response{}))
+	wg.Wait()
+	_ = p.Close()
 }
