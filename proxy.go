@@ -128,15 +128,14 @@ func (p *Proxy[T, R]) Target() Responder[T, R] {
 	return p.target
 }
 
-func (p *Proxy[T, R]) Close() error {
+func (p *Proxy[T, R]) Close() {
 	p.requestsMu.Lock()
 	defer p.requestsMu.Unlock()
 	if p.requests == nil {
-		return Closed
+		return
 	}
 	close(p.requests)
 	p.requests = nil
-	return nil
 }
 
 func (p *Proxy[T, R]) Drained() <-chan struct{} {

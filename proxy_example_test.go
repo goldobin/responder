@@ -76,13 +76,9 @@ func (p *kvServiceProxy) put(ctx context.Context, req kvPutRequest) (kvPutRespon
 	return p.putProxy.Respond(ctx, req)
 }
 
-func (p *kvServiceProxy) close() error {
-	getErr := p.getProxy.Close()
-	putErr := p.putProxy.Close()
-	if getErr != nil {
-		return getErr
-	}
-	return putErr
+func (p *kvServiceProxy) close() {
+	p.getProxy.Close()
+	p.putProxy.Close()
 }
 
 func Test_kvServiceProxy(t *testing.T) {
@@ -92,9 +88,7 @@ func Test_kvServiceProxy(t *testing.T) {
 	ctx := context.Background()
 	kv := newInMemoryKV()
 	proxy := newKVServiceProxy(kv)
-	defer func() {
-		_ = proxy.close()
-	}()
+	defer proxy.close()
 
 	// When - put values
 	_, err := proxy.put(ctx, kvPutRequest{key: "foo", value: "bar"})
@@ -129,7 +123,7 @@ func Test_kvServiceProxy_New(t *testing.T) {
 
 	// Then
 	require.NotNil(t, proxy)
-	_ = proxy.close()
+	proxy.close()
 }
 
 func Example_kvServiceProxy() {
@@ -141,7 +135,7 @@ func Example_kvServiceProxy() {
 	// Create buffered service proxy
 	proxy := newKVServiceProxy(kv)
 	defer func() {
-		_ = proxy.close()
+		proxy.close()
 	}()
 
 	// Put some values

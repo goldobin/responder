@@ -116,10 +116,9 @@ func Test_Proxy(t *testing.T) {
 				assert.NoError(t, respErr)
 			}
 
-			closeErr := p.Close()
+			p.Close()
 
 			// Then
-			assert.NoError(t, closeErr)
 			assert.Equal(t, uint32(tt.numRequests), m.count.Load())
 		})
 	}
@@ -177,7 +176,7 @@ func Test_Proxy_NoTarget(t *testing.T) {
 	// Then
 	assert.ErrorIs(t, err, responder.NoTarget)
 
-	_ = p.Close()
+	p.Close()
 }
 
 func Test_Proxy_RespondAfterClose(t *testing.T) {
@@ -190,7 +189,7 @@ func Test_Proxy_RespondAfterClose(t *testing.T) {
 		)
 
 		// When - close, then try to respond with a short timeout
-		_ = p.Close()
+		p.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
 		_, err := p.Respond(ctx, request{})
@@ -229,7 +228,7 @@ func Test_Proxy_ConcurrentRespondAndClose(t *testing.T) {
 				})
 
 				wg.Go(func() {
-					_ = p.Close()
+					p.Close()
 				})
 			}
 
@@ -243,13 +242,9 @@ func Test_Proxy_DoubleClose(t *testing.T) {
 	// Given
 	p := responder.NewProxyWithTarget(responder.Same[request, response](response{}))
 
-	// When
-	err1 := p.Close()
-	err2 := p.Close()
-
-	// Then
-	assert.NoError(t, err1)
-	assert.ErrorIs(t, err2, responder.Closed)
+	// When / Then - second close is a no-op, no panic
+	p.Close()
+	p.Close()
 }
 
 func Test_Proxy_ContextCancelledBeforeSend(t *testing.T) {
@@ -284,7 +279,7 @@ func Test_Proxy_ContextCancelledBeforeSend(t *testing.T) {
 		// Cleanup - unblock and wait
 		close(blocker)
 		<-done
-		_ = p.Close()
+		p.Close()
 	})
 }
 
@@ -311,7 +306,7 @@ func Test_Proxy_ContextCancelledWhileWaitingForResponse(t *testing.T) {
 
 		// Cleanup
 		close(proceed)
-		_ = p.Close()
+		p.Close()
 	})
 }
 
@@ -337,10 +332,9 @@ func Test_Proxy_CloseDrainsBufferedRequests(t *testing.T) {
 	}
 
 	wg.Wait()
-	closeErr := p.Close()
+	p.Close()
 
 	// Then - all requests should be processed
-	assert.NoError(t, closeErr)
 	assert.Equal(t, uint32(5), count.Load())
 }
 
@@ -368,17 +362,17 @@ func Test_Proxy_CloseWithInFlightRequests(t *testing.T) {
 	<-started // wait for request to start processing
 
 	// Close in background
-	closeDone := make(chan error)
+	closeDone := make(chan struct{})
 	go func() {
-		closeDone <- p.Close()
+		p.Close()
+		close(closeDone)
 	}()
 
 	// Let the request complete
 	close(proceed)
 
 	// Then
-	closeErr := <-closeDone
-	assert.NoError(t, closeErr)
+	<-closeDone
 	assert.Equal(t, uint32(1), count.Load())
 }
 
@@ -431,7 +425,7 @@ func Test_Proxy_WorkerExhaustion(t *testing.T) {
 		// Cleanup
 		close(blocker)
 		wg.Wait()
-		_ = p.Close()
+		p.Close()
 	})
 }
 
@@ -471,7 +465,7 @@ func Test_Proxy_SemaphoreAcquisitionCancelledByContext(t *testing.T) {
 		// Cleanup - unblock and wait
 		close(blocker)
 		<-done
-		_ = p.Close()
+		p.Close()
 	})
 }
 
@@ -499,7 +493,7 @@ func Test_Proxy_CloseContextTimeout(t *testing.T) {
 		<-started // wait for request to start processing
 
 		// When - close with timeout
-		closeErr := p.Close()
+		p.Close()
 		var drainErr error
 
 		select {
@@ -509,7 +503,6 @@ func Test_Proxy_CloseContextTimeout(t *testing.T) {
 		}
 
 		// Then
-		require.NoError(t, closeErr)
 		assert.ErrorIs(t, drainErr, context.DeadlineExceeded)
 
 		close(blocker)
@@ -531,7 +524,7 @@ func Test_Proxy_TargetError(t *testing.T) {
 	// Then
 	assert.ErrorIs(t, err, assert.AnError)
 
-	_ = p.Close()
+	p.Close()
 }
 
 func Test_Proxy_RequestPassthrough(t *testing.T) {
@@ -555,7 +548,7 @@ func Test_Proxy_RequestPassthrough(t *testing.T) {
 	assert.Equal(t, 42, resp)
 	assert.Equal(t, 21, received.Load())
 
-	_ = p.Close()
+	p.Close()
 }
 
 func Test_Proxy_DrainedAfterClose(t *testing.T) {
@@ -565,7 +558,7 @@ func Test_Proxy_DrainedAfterClose(t *testing.T) {
 	p := responder.NewProxyWithTarget(responder.Same[request, response](response{}))
 
 	// When
-	_ = p.Close()
+	p.Close()
 	<-p.Drained()
 
 	// Then - if we reach here, Drained() signaled
@@ -620,7 +613,7 @@ func Test_Proxy_UnboundConcurrencyRunsInParallel(t *testing.T) {
 		// Cleanup
 		close(blocker)
 		wg.Wait()
-		_ = p.Close()
+		p.Close()
 	})
 }
 
@@ -650,7 +643,7 @@ func Test_Proxy_SetTargetConcurrentWithRespond(t *testing.T) {
 	}
 
 	wg.Wait()
-	_ = p.Close()
+	p.Close()
 }
 
 func Test_Proxy_SetTargetConcurrentWithSetTarget(t *testing.T) {
@@ -674,7 +667,7 @@ func Test_Proxy_SetTargetConcurrentWithSetTarget(t *testing.T) {
 	}
 
 	wg.Wait()
-	_ = p.Close()
+	p.Close()
 }
 
 func Test_Proxy_SetTargetWhileProcessing(t *testing.T) {
@@ -713,7 +706,7 @@ func Test_Proxy_SetTargetWhileProcessing(t *testing.T) {
 
 	// Then - all requests should complete without race
 	assert.GreaterOrEqual(t, count.Load(), uint32(5))
-	_ = p.Close()
+	p.Close()
 }
 
 func Test_Proxy_SetTargetFromNil(t *testing.T) {
@@ -734,5 +727,5 @@ func Test_Proxy_SetTargetFromNil(t *testing.T) {
 
 	p.SetTarget(responder.Same[request](response{}))
 	wg.Wait()
-	_ = p.Close()
+	p.Close()
 }
